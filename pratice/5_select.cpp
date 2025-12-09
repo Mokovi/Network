@@ -5,119 +5,175 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include <cstring>
+#include <cerrno> // 新增：处理errno
 
 const uint16_t Port = 13145;
 const uint16_t MaxClientNum = 10;
 const uint16_t BufferSize = 1024;
 
+struct ClientInfo {
+    int fd = -1;
+    char ipStr[INET_ADDRSTRLEN] = "";
+    uint16_t port = 0;
+};
+
 int main() {
-    //创建套接字
+    // 1. 创建套接字（检查返回值）
     int serverFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverFd == -1) {
+        perror("socket failed");
+        return -1;
+    }
 
-
-    //设置端口复用
+    // 2. 设置端口复用（检查返回值）
     int opt = 1;
-    setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
+        perror("setsockopt failed");
+        close(serverFd);
+        return -1;
+    }
 
-    //绑定
+    // 3. 绑定（检查返回值）
     sockaddr_in serverAddr{};
     serverAddr.sin_addr.s_addr = INADDR_ANY;
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port = htons(Port);
-    bind(serverFd, (sockaddr*)&serverAddr, sizeof(serverAddr));
+    if (bind(serverFd, (sockaddr*)&serverAddr, sizeof(serverAddr)) == -1) {
+        perror("bind failed");
+        close(serverFd);
+        return -1;
+    }
 
-    //监听
-    listen(serverFd, 10);
+    // 4. 监听（检查返回值）
+    if (listen(serverFd, 10) == -1) {
+        perror("listen failed");
+        close(serverFd);
+        return -1;
+    }
     printf("Select I/O Server listening on port %d\n", Port);
 
-    int clientFd[MaxClientNum];
-    char clientIpStr[MaxClientNum][INET_ADDRSTRLEN];
-    uint16_t clientPort[MaxClientNum];
-    for(int i = 0; i < MaxClientNum; i++) clientFd[i] = -1;
+    ClientInfo client[MaxClientNum];
+    char buffer[BufferSize];
+
     fd_set readFds;
     int maxFd, activity;
-    char buffer[BufferSize];
     while(1) {
-        //清零，每次循环重新往fd集合中添加
+        // 清零，每次循环重新添加fd
         FD_ZERO(&readFds);
 
-        //添加服务器fd
+        // 添加服务器fd
         FD_SET(serverFd, &readFds);
         maxFd = serverFd;
 
-        //添加客户端fd
+        // 添加客户端fd
         for(int i = 0; i < MaxClientNum; i++) {
-            if(clientFd[i] == -1) continue;
-            FD_SET(clientFd[i], &readFds);
-            maxFd = clientFd[i] > maxFd ? clientFd[i] : maxFd;
+            if(client[i].fd == -1) continue;
+            FD_SET(client[i].fd, &readFds);
+            maxFd = client[i].fd > maxFd ? client[i].fd : maxFd;
         }
 
-        //设置超时时间
-        timeval timeout;
-        timeout.tv_sec = 3;
-        timeout.tv_usec = 0;
+        // 设置超时时间（每次循环重新初始化，避免select修改的影响）
+        timeval timeout{3, 0}; // C++11 聚合初始化，更简洁
 
-        //等待激活
-        activity = select(maxFd+1, &readFds, NULL, NULL, &timeout);
+        // 等待事件触发（检查返回值）
+        activity = select(maxFd + 1, &readFds, NULL, NULL, &timeout);
         if (activity < 0) {
-            perror("Select!");
+            // 处理信号中断（可重试）
+            if (errno == EINTR) {
+                std::cout << "select interrupted by signal, retry\n";
+                continue;
+            }
+            perror("select failed");
             break;
         }
         else if (activity == 0) {
             std::cout << "Timeout.\n";
             continue;
         }
-        
 
-        //处理服务器fd
+        // 处理服务器fd（新连接）
         if (FD_ISSET(serverFd, &readFds)) {
             sockaddr_in clientAddr{};
             socklen_t clientLen = sizeof(clientAddr);
             int newClient = accept(serverFd, (sockaddr*)&clientAddr, &clientLen);
-            int i = 0;
-            if (newClient != -1) {
-                for (i = 0; i < MaxClientNum; i++) {
-                    if(clientFd[i] == -1) {
-                        clientFd[i] = newClient;
-                        inet_ntop(AF_INET, &clientAddr.sin_addr.s_addr, clientIpStr[i], INET_ADDRSTRLEN);
-                        clientPort[i] = ntohs(clientAddr.sin_port);
-                        printf("Client %d [%s:%d] connected\n", i, clientIpStr[i], clientPort[i]);
-                        break;
-                    }
+            if (newClient == -1) {
+                perror("accept failed");
+                continue; // 非致命错误，继续运行
+            }
+
+            // 找client数组空位
+            int clientIdx = -1;
+            for (int i = 0; i < MaxClientNum; i++) {
+                if (client[i].fd == -1) {
+                    clientIdx = i;
+                    break;
                 }
             }
-            if (i == MaxClientNum) {
+            if (clientIdx == -1) {
                 printf("Too many clients, closing connection\n");
                 close(newClient);
+                continue;
             }
+
+            // 填充客户端信息
+            client[clientIdx].fd = newClient;
+            inet_ntop(AF_INET, &clientAddr.sin_addr, client[clientIdx].ipStr, INET_ADDRSTRLEN);
+            client[clientIdx].port = ntohs(clientAddr.sin_port);
+            printf("[%s:%d] connected\n", client[clientIdx].ipStr, client[clientIdx].port); // 新增：连接日志
         }
 
-        //处理客户端fd
+        // 处理客户端fd（消息/断开）
         for(int i = 0; i < MaxClientNum; i++) {
-            if(clientFd[i] == -1) continue;
-            if(FD_ISSET(clientFd[i], &readFds)) {
-                int byteRecv = recv(clientFd[i], buffer, BufferSize-1, 0);
-                if (byteRecv == 0) {
-                    printf("Client %d [%s:%d] disconnected\n", i, clientIpStr[i], clientPort[i]);
-                    close(clientFd[i]);
-                    clientFd[i] = -1;//close不会将其置为-1，得手动置为-1
+            if(client[i].fd == -1 || !FD_ISSET(client[i].fd, &readFds)) continue;
+
+            // 清空缓冲区，避免残留旧数据
+            memset(buffer, 0, BufferSize);
+            ssize_t byteRecv = recv(client[i].fd, buffer, BufferSize - 1, 0);
+            if (byteRecv < 0) {
+                // 区分可重试错误和致命错误
+                if (errno == EINTR || errno == EAGAIN) {
+                    continue; // 可重试，不关闭fd
                 }
-                else if (byteRecv > 0) {
-                    buffer[byteRecv] = '\0';
-                    printf("Client %d [%s:%d]: %s\n", i, clientIpStr[i], clientPort[i], buffer);
-                    //回显
-                    send(clientFd[i], buffer, strlen(buffer), 0);
-                }
-                else {
-                    perror("recv error");
-                    close(clientFd[i]);
-                    clientFd[i] = -1;
+                perror("recv failed");
+                close(client[i].fd);
+                client[i].fd = -1;
+                continue;
+            }
+            else if (byteRecv == 0) {
+                // 客户端正常断开
+                printf("[%s:%d] disconnected\n", client[i].ipStr, client[i].port);
+                close(client[i].fd);
+                client[i].fd = -1;
+            }
+            else {
+                buffer[byteRecv] = '\0'; // 仅用于打印字符串
+                printf("[%s:%d]: %s\n", client[i].ipStr, client[i].port, buffer);
+                
+                // 回显数据：用实际接收的字节数，避免\0截断
+                ssize_t byteSend = send(client[i].fd, buffer, byteRecv, 0);
+                if (byteSend < 0) {
+                    perror("send failed");
+                    close(client[i].fd);
+                    client[i].fd = -1;
+                } else if (byteSend != byteRecv) {
+                    // 处理部分发送（阻塞fd下少见，但工业场景需考虑）
+                    printf("[%s:%d] send partial data: %zd/%zd\n", 
+                           client[i].ipStr, client[i].port, byteSend, byteRecv);
                 }
             }
         }
     }
     
+    // 程序退出前关闭所有fd（规范资源释放）
     close(serverFd);
+    for (int i = 0; i < MaxClientNum; i++) {
+        if (client[i].fd != -1) {
+            printf("[%s:%d] close connection on exit\n", client[i].ipStr, client[i].port);
+            close(client[i].fd);
+            client[i].fd = -1;
+        }
+    }
+
     std::cout << "END.\n";
     return 0;
 }

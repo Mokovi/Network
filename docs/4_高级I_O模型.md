@@ -523,8 +523,8 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout);
 ```c
 struct pollfd {
     int   fd;      // 文件描述符
-    short events;  // 监听的事件
-    short revents; // 返回的事件
+    short events;  // 监听的事件 【输入参数】告诉内核：我要监控这个fd上的哪些事件（用户主动设置）
+    short revents; // 返回的事件 【输出参数】内核返回：这个fd上实际发生了哪些事件（内核填充，用户只读）
 };
 ```
 
@@ -1298,188 +1298,324 @@ io_uring是Linux 5.1引入的现代异步I/O接口，提供更高的性能。
 
 // 初始化io_uring
 int io_uring_queue_init(unsigned entries, struct io_uring *ring, unsigned flags);
+- entries : 希望队列中包含的 SQE 数量（可理解为“最大并发请求数”）。通常使用 256 / 512 / 1024。
+- ring 输出参数，指向 io_uring 结构体（你必须创建一个 struct io_uring 变量传入）。
+- flags 初始化参数 • 0 — 默认
+返回值: 0：成功 负数：失败，对应 Linux errno（例如 -EINVAL）
 
 // 获取提交队列条目
 struct io_uring_sqe *io_uring_get_sqe(struct io_uring *ring);
+返回值
+• 返回 struct io_uring_sqe*：成功
+• 返回 NULL：SQ 满了（entries 不够用）
 
 // 准备读操作
 void io_uring_prep_read(struct io_uring_sqe *sqe, int fd, void *buf, 
                         unsigned nbytes, off_t offset);
+-offset 文件偏移：• 文件 IO → 有效（0、指定偏移） • socket → 必须是 -1（内核决定读多少）
+
 
 // 准备写操作
 void io_uring_prep_write(struct io_uring_sqe *sqe, int fd, const void *buf, 
                          unsigned nbytes, off_t offset);
+- socket 写时 offset 通常为 -1。
+
+//用户数据绑定函数
+void io_uring_sqe_set_data(struct io_uring_sqe *sqe, void *data);
+简单理解：你把“上下文”塞进 SQE → 内核执行 → 返回 CQE → 你再把这段数据取回来继续处理。
 
 // 提交请求
 int io_uring_submit(struct io_uring *ring);
+返回值
+• ≥ 0：成功，返回实际提交的 SQE 数量
+• < 0：失败，对应 errno
+注意：如果你积攒多个 SQE，再一起 submit，可以减少系统调用次数，提高性能。
 
 // 等待完成
 int io_uring_wait_cqe(struct io_uring *ring, struct io_uring_cqe **cqe_ptr);
+返回值
+• 0：成功
+• 负数：失败（一般不会）
 
-// 获取完成队列条目
+// 获取完成队列条目（非阻塞地从 CQ 队列中取出一个完成事件）
 struct io_uring_cqe *io_uring_peek_cqe(struct io_uring *ring, unsigned *head);
+参数
+- ring → io_uring 实例。
+- head → CQ 队列头（可传 NULL，一般不需要用）。
+返回值
+• CQE 指针：成功
+• NULL：CQ 队列为空（没有完成事件）
 
-// 标记完成
+// 标记完成（标记某个 CQE 为“已处理”，让内核清理队列。）
 void io_uring_cqe_seen(struct io_uring *ring, struct io_uring_cqe *cqe);
+- cqe（来自 wait_cqe 或 peek_cqe）。
 
-// 清理io_uring
+
+// 清理io_uring（释放 io_uring 实例，关闭所有映射的内存与文件描述符。）
 void io_uring_queue_exit(struct io_uring *ring);
 ```
 
 #### 8.2.3 io_uring示例
 
 ```c
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
+#include <iostream>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <netinet/in.h>
 #include <liburing.h>
+#include <cstring>
+#include <cstdlib>
+#include <cerrno>
+#include <fcntl.h>
 
-#define BUFFER_SIZE 1024
-#define PORT 8080
-#define MAX_CONNECTIONS 10
+const uint16_t Port = 13145;
+const uint16_t MaxClientNum = 10;
+const uint16_t BufferSize = 1024;
+const uint16_t QueueDepth = 32;
 
-struct connection {
-    int fd;
-    char buffer[BUFFER_SIZE];
-    int bytes_read;
-    int bytes_written;
+enum OpType{
+    OP_ACCEPT = 1,
+    OP_RECV = 2,
+    OP_SEND = 3
 };
 
+struct ClientInfo{
+    int clientFd = -1;
+    char ipStr[INET_ADDRSTRLEN] = "";
+    uint16_t port = 0;
+    char buffer[BufferSize];
+};
+
+typedef struct {
+    OpType type;
+    ClientInfo* client;
+    sockaddr_in addr;
+    socklen_t addr_len;
+    char* buf;
+    size_t buf_len;
+}IoData;
+
+int set_nonblock(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 int main() {
-    struct io_uring ring;
-    struct io_uring_sqe *sqe;
-    struct io_uring_cqe *cqe;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len;
-    struct connection *conn;
-    int server_sockfd, client_sockfd;
-    int i, ret;
-
-    // 初始化io_uring
-    if (io_uring_queue_init(32, &ring, 0) < 0) {
-        perror("io_uring_queue_init");
-        exit(EXIT_FAILURE);
+    int serverFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverFd == -1) {
+        perror("Server socket");
+        exit(1);
     }
 
-    // 创建服务器套接字
-    server_sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sockfd == -1) {
-        perror("socket");
-        io_uring_queue_exit(&ring);
-        exit(EXIT_FAILURE);
-    }
+    int opt = 1;
+    setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    // 设置服务器地址
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    sockaddr_in serverAddr{};
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(Port);
 
-    // 绑定地址
-    if (bind(server_sockfd, (struct sockaddr*)&server_addr, 
-             sizeof(server_addr)) == -1) {
+    if (bind(serverFd, (sockaddr*)&serverAddr, sizeof(serverAddr)) == -1) {
         perror("bind");
-        close(server_sockfd);
-        io_uring_queue_exit(&ring);
-        exit(EXIT_FAILURE);
+        close(serverFd);
+        exit(1);
     }
 
-    // 开始监听
-    if (listen(server_sockfd, 5) == -1) {
+    if (listen(serverFd, 128) == -1) {
         perror("listen");
-        close(server_sockfd);
-        io_uring_queue_exit(&ring);
-        exit(EXIT_FAILURE);
+        close(serverFd);
+        exit(1);
     }
 
-    printf("io_uring Server listening on port %d\n", PORT);
+    if (set_nonblock(serverFd) < 0) {
+        perror("set_nonblock");
+        close(serverFd);
+        return 1;
+    }
 
-    // 提交accept请求
-    sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_accept(sqe, server_sockfd, (struct sockaddr*)&client_addr, 
-                        &client_len, 0);
-    io_uring_sqe_set_data(sqe, NULL);
+    printf("io_uring Server listening on port %d\n", Port);
+
+    // 初始化 io_uring
+    io_uring ring;
+    if (io_uring_queue_init(QueueDepth, &ring, 0) < 0) {
+        perror("io_uring_queue_init");
+        close(serverFd);
+        exit(1);
+    }
+
+    // accept 异步请求
+    IoData* initialAccept = new IoData();
+    initialAccept->type = OP_ACCEPT;
+    initialAccept->client = nullptr;
+    initialAccept->addr_len = sizeof(initialAccept->addr);
+
+    io_uring_sqe * sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        fprintf(stderr, "get sqe failed\n");
+        delete initialAccept;
+        io_uring_queue_exit(&ring);
+        close(serverFd);
+        return 1;
+    }
+    io_uring_prep_accept(sqe, serverFd, (sockaddr*)&initialAccept->addr, &initialAccept->addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    io_uring_sqe_set_data(sqe, initialAccept);
     io_uring_submit(&ring);
 
+    // client array
+    ClientInfo client[MaxClientNum];
+    //for (int i = 0; i < MaxClientNum; ++i) client[i].clientFd = -1;
+
     while (1) {
-        // 等待完成事件
-        ret = io_uring_wait_cqe(&ring, &cqe);
+        io_uring_cqe *cqe = nullptr;
+        int ret = io_uring_wait_cqe(&ring, &cqe);
         if (ret < 0) {
-            perror("io_uring_wait_cqe");
+            fprintf(stderr, "io_uring_wait_cqe error: %s\n", strerror(-ret));
             break;
         }
 
-        if (cqe->res < 0) {
-            fprintf(stderr, "Async operation failed: %s\n", strerror(-cqe->res));
+        IoData* ioData = (IoData*)io_uring_cqe_get_data(cqe);
+        int res = cqe->res;
+
+        if (!ioData) {
+            // unexpected but handle gracefully
             io_uring_cqe_seen(&ring, cqe);
             continue;
         }
 
-        if (sqe->opcode == IORING_OP_ACCEPT) {
-            // 新连接
-            client_sockfd = cqe->res;
-            printf("Client connected\n");
-
-            // 分配连接结构
-            conn = malloc(sizeof(struct connection));
-            conn->fd = client_sockfd;
-            conn->bytes_read = 0;
-            conn->bytes_written = 0;
-
-            // 提交读请求
-            sqe = io_uring_get_sqe(&ring);
-            io_uring_prep_read(sqe, client_sockfd, conn->buffer, BUFFER_SIZE, 0);
-            io_uring_sqe_set_data(sqe, conn);
-            io_uring_submit(&ring);
-
-            // 提交新的accept请求
-            sqe = io_uring_get_sqe(&ring);
-            io_uring_prep_accept(sqe, server_sockfd, (struct sockaddr*)&client_addr, 
-                                &client_len, 0);
-            io_uring_sqe_set_data(sqe, NULL);
-            io_uring_submit(&ring);
-
-        } else if (sqe->opcode == IORING_OP_READ) {
-            // 读取完成
-            conn = (struct connection*)io_uring_cqe_get_data(cqe);
-            conn->bytes_read = cqe->res;
-
-            if (conn->bytes_read > 0) {
-                printf("Received: %.*s", conn->bytes_read, conn->buffer);
-                
-                // 提交写请求（回显）
-                sqe = io_uring_get_sqe(&ring);
-                io_uring_prep_write(sqe, conn->fd, conn->buffer, conn->bytes_read, 0);
-                io_uring_sqe_set_data(sqe, conn);
+        if (ioData->type == OP_ACCEPT) {
+            // accept completed
+            if (res < 0) {
+                fprintf(stderr, "accept failed: %s\n", strerror(-res));
+                // re-arm accept
+                IoData* nextAccept = new IoData();
+                nextAccept->type = OP_ACCEPT;
+                nextAccept->client = nullptr;
+                nextAccept->addr_len = sizeof(nextAccept->addr);
+                io_uring_sqe* nsqe = io_uring_get_sqe(&ring);
+                io_uring_prep_accept(nsqe, serverFd, (sockaddr*)&nextAccept->addr, &nextAccept->addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+                io_uring_sqe_set_data(nsqe, nextAccept);
                 io_uring_submit(&ring);
-            } else {
-                printf("Client disconnected\n");
-                close(conn->fd);
-                free(conn);
+                delete ioData;
+                io_uring_cqe_seen(&ring, cqe);
+                continue;
             }
 
-        } else if (sqe->opcode == IORING_OP_WRITE) {
-            // 写入完成
-            conn = (struct connection*)io_uring_cqe_get_data(cqe);
-            
-            // 提交新的读请求
-            sqe = io_uring_get_sqe(&ring);
-            io_uring_prep_read(sqe, conn->fd, conn->buffer, BUFFER_SIZE, 0);
-            io_uring_sqe_set_data(sqe, conn);
+            int newClientFd = res;
+            // find slot
+            int idx = -1;
+            for (int i = 0; i < MaxClientNum; ++i) {
+                if (client[i].clientFd == -1) {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx == -1) {
+                // too many clients
+                fprintf(stderr, "Too many clients, closing fd=%d\n", newClientFd);
+                close(newClientFd);
+            } else {
+                client[idx].clientFd = newClientFd;
+                inet_ntop(AF_INET, &ioData->addr.sin_addr, client[idx].ipStr, INET_ADDRSTRLEN);
+                client[idx].port = ntohs(ioData->addr.sin_port);
+                printf("[%s:%d] has been connected.\n", client[idx].ipStr, client[idx].port);
+
+                // submit recv for this client (IoData per request)
+                IoData* recvIo = new IoData();
+                recvIo->type = OP_RECV;
+                recvIo->client = &client[idx];
+                io_uring_sqe* rsqe = io_uring_get_sqe(&ring);
+                io_uring_prep_recv(rsqe, client[idx].clientFd, client[idx].buffer, BufferSize - 1, 0);
+                io_uring_sqe_set_data(rsqe, recvIo);
+            }
+
+            // re-arm accept (new IoData)
+            IoData* nextAccept = new IoData();
+            nextAccept->type = OP_ACCEPT;
+            nextAccept->client = nullptr;
+            nextAccept->addr_len = sizeof(nextAccept->addr);
+            io_uring_sqe* asqe = io_uring_get_sqe(&ring);
+            io_uring_prep_accept(asqe, serverFd, (sockaddr*)&nextAccept->addr, &nextAccept->addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            io_uring_sqe_set_data(asqe, nextAccept);
+
             io_uring_submit(&ring);
+            // free this accept IoData
+            delete ioData;
+        }
+        else if (ioData->type == OP_RECV) {
+            ClientInfo* cur = ioData->client;
+            if (!cur) {
+                delete ioData;
+                io_uring_cqe_seen(&ring, cqe);
+                continue;
+            }
+            if (res < 0) {
+                fprintf(stderr, "recv failed for fd=%d: %s\n", cur->clientFd, strerror(-res));
+                close(cur->clientFd);
+                cur->clientFd = -1;
+                delete ioData;
+                io_uring_cqe_seen(&ring, cqe);
+                continue;
+            } else if (res == 0) {
+                printf("[%s:%d] has been disconnected.\n", cur->ipStr, cur->port);
+                close(cur->clientFd);
+                cur->clientFd = -1;
+                delete ioData;
+                io_uring_cqe_seen(&ring, cqe);
+                continue;
+            } else {
+                int n = res;
+                cur->buffer[n] = '\0';
+                printf("[%s:%d]: %s\n", cur->ipStr, cur->port, cur->buffer);
+
+                // prepare send: copy data
+                IoData* sendIo = new IoData();
+                sendIo->type = OP_SEND;
+                sendIo->client = cur;
+                sendIo->buf_len = n;
+                sendIo->buf = (char*)malloc(n);
+                if (!sendIo->buf) {
+                    fprintf(stderr, "malloc failed for send buffer\n");
+                    delete sendIo;
+                } else {
+                    memcpy(sendIo->buf, cur->buffer, n);
+                    io_uring_sqe* wsqe = io_uring_get_sqe(&ring);
+                    io_uring_prep_send(wsqe, cur->clientFd, sendIo->buf, sendIo->buf_len, 0);
+                    io_uring_sqe_set_data(wsqe, sendIo);
+                }
+
+                // re-arm recv for this client (new IoData)
+                IoData* nextRecv = new IoData();
+                nextRecv->type = OP_RECV;
+                nextRecv->client = cur;
+                io_uring_sqe* rsqe2 = io_uring_get_sqe(&ring);
+                io_uring_prep_recv(rsqe2, cur->clientFd, cur->buffer, BufferSize - 1, 0);
+                io_uring_sqe_set_data(rsqe2, nextRecv);
+
+                io_uring_submit(&ring);
+                delete ioData;
+            }
+        }
+        else if (ioData->type == OP_SEND) {
+            // send completion: free send buffer and IoData
+            if (ioData->buf) free(ioData->buf);
+            delete ioData;
+            // nothing else to do
+        } else {
+            // unknown op
+            delete ioData;
         }
 
         io_uring_cqe_seen(&ring, cqe);
     }
 
-    close(server_sockfd);
     io_uring_queue_exit(&ring);
+    close(serverFd);
+    std::cout << "End!\n";
     return 0;
 }
+
 ```
 
 ## 9. I/O模型对比
@@ -1541,5 +1677,5 @@ int main() {
 
 **文档版本**：v1.0  
 **创建时间**：2025年09月30日 17:02:28 CST  
-**最后更新**：2025年09月30日 17:02:28 CST  
+**最后更新**：2025年12月08日
 **维护者**：Gamma
