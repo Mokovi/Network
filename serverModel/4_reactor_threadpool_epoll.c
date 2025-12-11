@@ -219,6 +219,26 @@ void accept_handler(int epoll_fd, connection_t* accept_conn) {
  * @param arg 连接结构体指针
  * @note 耗时操作移到线程池，Reactor主线程仅负责事件分发
  */
+void build_http_response(connection_t* conn, const char* body)
+{
+    static const char* header_fmt =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n";
+
+    size_t body_len = strlen(body);
+
+    int header_len = snprintf(conn->wbuffer, conn->wbuffer_size,
+                              header_fmt, body_len);
+
+    memcpy(conn->wbuffer + header_len, body, body_len);
+
+    conn->wbuffer_sent = header_len + body_len;
+}
+
+
 void read_worker_task(void* arg) {
     connection_t* conn = (connection_t*)arg;
     if (!conn || conn->fd < 0) return;
@@ -236,10 +256,16 @@ void read_worker_task(void* arg) {
                    (unsigned long)pthread_self(), // 打印处理任务的线程ID
                    conn->read_buffer);
             // 回显数据：拷贝到写缓冲区
+            #if 0
             pthread_mutex_lock(&conn->lock);
             memcpy(conn->wbuffer, conn->read_buffer, n);
             conn->wbuffer_sent = n;
             pthread_mutex_unlock(&conn->lock);
+            #else
+            pthread_mutex_lock(&conn->lock);
+            build_http_response(conn, conn->read_buffer);
+            pthread_mutex_unlock(&conn->lock);
+            #endif
             have_pending_write = 1;
         } else if (n == 0) {
             // 客户端关闭连接
@@ -432,8 +458,9 @@ int main(int argc, char* argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // 7. 创建线程池（4个工作线程）
-    g_thread_pool = thread_pool_create(4);
+    // 7. 创建线程池 根据cpu核心数
+    int threadNum = 8;
+    g_thread_pool = thread_pool_create(threadNum);
     if (!g_thread_pool) {
         fprintf(stderr, "create thread pool failed\n");
         close(listen_fd);

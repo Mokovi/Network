@@ -95,6 +95,24 @@ void accept_handler(int epoll_fd, connection_t* accept_conn);
 void read_handler(int epoll_fd, connection_t* conn);
 void write_handler(int epoll_fd, connection_t* conn);
 
+void build_http_response(connection_t* conn, const char* body)
+{
+    static const char* header_fmt =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n";
+
+    size_t body_len = strlen(body);
+
+    int header_len = snprintf(conn->wbuffer, conn->wbuffer_size,
+                              header_fmt, body_len);
+
+    memcpy(conn->wbuffer + header_len, body, body_len);
+
+    conn->wbuffer_sent = header_len + body_len;
+}
 void accept_handler(int epoll_fd, connection_t* accept_conn) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
@@ -137,8 +155,13 @@ void read_handler(int epoll_fd, connection_t* conn) {
             conn->read_buffer[n] = '\0';
             printf("[%s:%d]: %s\n", inet_ntoa(conn->addr.sin_addr), ntohs(conn->addr.sin_port), conn->read_buffer);
             // 回显数据
-            memcpy(conn->wbuffer, conn->read_buffer, n);
-            conn->wbuffer_sent = n;
+            #if 1
+                build_http_response(conn, conn->read_buffer);
+            #else
+                memcpy(conn->wbuffer, conn->read_buffer, n);
+                conn->wbuffer_sent = n;
+            #endif
+            
             epoll_mod_fd(epoll_fd, conn->fd, conn, EPOLLOUT | EPOLLET);
         } else if (n == 0) {
             // 客户端关闭连接
